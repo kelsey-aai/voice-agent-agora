@@ -1,0 +1,16 @@
+# Agora server-side RTC SDK (beta — see README "Limitations")
+# https://pypi.org/project/agora-python-server-sdk/
+agora-python-server-sdk==2.2.4
+
+# Agora token signing for production channels with App Certificate enabled
+agora-token-builder==1.0.0
+
+# AssemblyAI Voice Agent API connection
+websockets==13.1
+
+# Resampling between Agora's 16 kHz frames and Voice Agent API's 24 kHz audio
+numpy==2.1.3
+scipy==1.14.1
+
+# Env loading
+python-dotenv==1.0.1

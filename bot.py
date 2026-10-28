@@ -1,400 +1,283 @@
-"""Agora <-> AssemblyAI Voice Agent API bridge bot.
-
-A server-side bot that:
-  1. Joins an Agora RTC channel as a publishing participant.
-  2. Subscribes to the user's audio (16 kHz mono PCM via Agora's PcmAudioFrame).
-  3. Resamples to 24 kHz and forwards it to the AssemblyAI Voice Agent API
-     over a single WebSocket (STT + LLM + TTS handled server-side).
-  4. Receives reply.audio chunks (24 kHz PCM16), resamples back to 16 kHz,
-     and publishes them into the channel as the bot's outbound audio track.
-
-Honest note on the Agora SDK
-----------------------------
-Agora's "agora-python-server-sdk" is a thin Python wrapper around the C++
-RTC SDK. The exact class layout has churned across releases, and Agora's
-recommended path for new voice-agent projects today is the
-**Conversational AI Engine** (a hosted REST service that wires STT/LLM/TTS
-into a channel for you). We pin a known release and document every Agora
-API call we make. If your Agora SDK version names things differently,
-the # AGORA_BRIDGE_TODO blocks below show exactly which surface area to
-re-bind. The AssemblyAI side of the bridge is stable and unaffected.
-
-Run:
-    python bot.py --channel my-channel
-"""
-
-from __future__ import annotations
-
-import argparse
-import asyncio
-import base64
-import json
-import logging
+# bot.py
 import os
-import signal
-import sys
-from dataclasses import dataclass
-from typing import Optional
+import queue
+import string
+import threading
+import time
 
-import numpy as np
-import websockets
+import assemblyai as aai
+from assemblyai.streaming.v3 import (
+    BeginEvent,
+    RealTimeError,
+    RealTimeEvents,
+    RealTimeParameters,
+    RealTimeTranscriber,
+    RealTimeTranscriberOptions,
+    TurnEvent,
+)
 from dotenv import load_dotenv
-from scipy.signal import resample_poly
 
-# ---------------------------------------------------------------------------
-# Agora server SDK imports — pinned to agora-python-server-sdk==2.2.4.
-# If you upgrade, verify the symbols below still exist; otherwise update
-# the # AGORA_BRIDGE_TODO sections.
-# ---------------------------------------------------------------------------
-try:
-    from agora.rtc.agora_service import AgoraService, AgoraServiceConfig
-    from agora.rtc.rtc_connection import RTCConnection, RTCConnConfig
-    from agora.rtc.audio_frame_observer import IAudioFrameObserver, AudioFrame
-    from agora.rtc.audio_pcm_data_sender import AudioPcmDataSender
-    from agora.rtc.local_user_observer import IRTCLocalUserObserver
-    from agora.rtc.media_node_factory import MediaNodeFactory
-    AGORA_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional during local testing
-    AGORA_AVAILABLE = False
-    AgoraService = AgoraServiceConfig = RTCConnection = RTCConnConfig = None  # type: ignore
-    IAudioFrameObserver = AudioFrame = AudioPcmDataSender = None  # type: ignore
-    IRTCLocalUserObserver = MediaNodeFactory = None  # type: ignore
-
-from agora_token_builder import RtcTokenBuilder  # type: ignore
+# Agora Server Gateway SDK (pip install agora_python_server_sdk)
+from agora.rtc.agora_base import (
+    AgoraServiceConfig,
+    AudioPublishType,
+    AudioScenarioType,
+    AudioSubscriptionOptions,
+    ChannelProfileType,
+    ClientRoleType,
+    RTCConnConfig,
+    RtcConnectionPublishConfig,
+)
+from agora.rtc.agora_service import AgoraService
+from agora.rtc.audio_frame_observer import IAudioFrameObserver
 
 load_dotenv()
+API_KEY = os.environ["ASSEMBLYAI_API_KEY"]
+AGORA_APP_ID = os.environ["AGORA_APP_ID"]
+AGORA_TOKEN = os.environ.get("AGORA_TOKEN", "")  # empty if App Certificate is off
+AGORA_CHANNEL = os.environ.get("AGORA_CHANNEL", "voice-agent-demo")
+AGORA_BOT_UID = os.environ.get("AGORA_BOT_UID", "9999")
 
-LOG = logging.getLogger("agora-voice-agent")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# One rate end to end: Agora delivers 16 kHz frames, speech-to-text takes
+# 16 kHz, and text-to-speech returns 16 kHz. No resampling in this bot.
+SAMPLE_RATE = 16_000
+BYTES_PER_MS = SAMPLE_RATE * 2 // 1000  # 16-bit mono: 32 bytes per millisecond
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
-AGORA_APP_ID = os.environ.get("AGORA_APP_ID", "")
-AGORA_APP_CERTIFICATE = os.environ.get("AGORA_APP_CERTIFICATE", "")
-DEFAULT_CHANNEL = os.environ.get("AGORA_CHANNEL", "voice-agent-demo")
-DEFAULT_BOT_UID = int(os.environ.get("AGORA_BOT_UID", "9999"))
+LLM_MODEL = "claude-haiku-4-5-20251001"  # any model on LLM Gateway
+GREETING = "Hi, I just joined the call. What can I help you with?"
+SYSTEM_PROMPT = f"""You are a friendly voice assistant on a live call.
+Your replies are spoken aloud: one or two short sentences, no lists or markdown.
+You have already greeted the caller with: {GREETING}"""
 
-VA_URL = "wss://agents.assemblyai.com/v1/ws"
+# Listen: Universal-3.6 Pro Realtime streaming speech-to-text
+stt = RealTimeTranscriber(RealTimeTranscriberOptions(), api_key=API_KEY)
 
-# Agora delivers/accepts 16 kHz PCM frames easily; the Voice Agent API uses
-# 24 kHz by default. We resample on each side of the bridge.
-AGORA_RATE = 16_000
-VA_RATE = 24_000
+# Think: an LLM through LLM Gateway, on the same API key
+llm = aai.LLMGateway(api_key=API_KEY)
 
-SYSTEM_PROMPT = (
-    "You are a friendly voice assistant joining a live Agora call. "
-    "Keep replies to one or two short sentences. Speak naturally."
+# Speak: one text-to-speech session for the whole call, at Agora's 16 kHz
+tts = aai.TTSSession(
+    aai.TTSConfig(
+        voice_id="49c443a4-8a1d-5f7e-b70b-98bdbd9823c3",  # Audrey
+        language="english",
+        sample_rate=SAMPLE_RATE,
+        encoding="pcm_s16le",
+    ),
+    api_key=API_KEY,
 )
-GREETING = "Hi — I just joined the call. What would you like help with?"
-VOICE = "ivy"
+
+messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+turns = queue.Queue()            # finished caller turns, in order
+speaking = threading.Event()     # set while the bot's reply is playing in the channel
+interrupted = threading.Event()  # set when the caller talks over the bot
+last_spoke_at = 0.0
+# bot.py (continued): joining the channel and hearing the caller
+class CallerAudio(IAudioFrameObserver):
+    """Receives each remote user's 16 kHz PCM frames, on an Agora SDK thread."""
+
+    def __init__(self):
+        super().__init__()
+        self.frames = queue.Queue()
+        self.caller_uid = None
+        self.joined = threading.Event()
+
+    def on_playback_audio_frame_before_mixing(
+        self, agora_local_user, channelId, uid, frame, vad_result_state, vad_result_bytearray
+    ):
+        if self.caller_uid is None:
+            self.caller_uid = uid  # follow the first person who speaks
+            self.joined.set()
+        if uid == self.caller_uid:
+            # Copy only: Agora callbacks must not call SDK APIs or do heavy work
+            self.frames.put(bytes(frame.buffer))
+        return 1
+
+    def chunks(self):
+        """Yield 50 ms chunks for speech-to-text. Ends when None is queued."""
+        buf = bytearray()
+        while True:
+            frame = self.frames.get()
+            if frame is None:
+                return
+            buf += frame
+            if len(buf) >= BYTES_PER_MS * 50:
+                yield bytes(buf)
+                buf.clear()
 
 
-# ---------------------------------------------------------------------------
-# Resampling helpers (polyphase, fast and high-quality)
-# ---------------------------------------------------------------------------
-def resample_pcm16(pcm: bytes, from_rate: int, to_rate: int) -> bytes:
-    if from_rate == to_rate or not pcm:
-        return pcm
-    samples = np.frombuffer(pcm, dtype=np.int16)
-    # Use small integer factors for resample_poly. 16k <-> 24k = 2/3.
-    if from_rate == 16_000 and to_rate == 24_000:
-        up, down = 3, 2
-    elif from_rate == 24_000 and to_rate == 16_000:
-        up, down = 2, 3
-    else:
-        from math import gcd
-        g = gcd(from_rate, to_rate)
-        up, down = to_rate // g, from_rate // g
-    out = resample_poly(samples.astype(np.float32), up, down)
-    return np.clip(out, -32768, 32767).astype(np.int16).tobytes()
+def join_agora(caller):
+    service = AgoraService()
+    config = AgoraServiceConfig()
+    config.appid = AGORA_APP_ID
+    config.audio_scenario = AudioScenarioType.AUDIO_SCENARIO_AI_SERVER
+    service.initialize(config)
 
-
-# ---------------------------------------------------------------------------
-# AssemblyAI Voice Agent API client
-# ---------------------------------------------------------------------------
-@dataclass
-class AgentBridge:
-    """Owns the WebSocket to AssemblyAI and exposes simple in/out queues."""
-
-    ws: websockets.WebSocketClientProtocol
-    inbound_audio: asyncio.Queue  # mic PCM16 @ 24 kHz from caller
-    outbound_audio: asyncio.Queue  # reply PCM16 @ 24 kHz to publish
-    session_ready: asyncio.Event
-    stop: asyncio.Event
-
-    @classmethod
-    async def connect(cls) -> "AgentBridge":
-        if not ASSEMBLYAI_API_KEY:
-            raise RuntimeError("ASSEMBLYAI_API_KEY missing — set it in .env")
-        headers = {"Authorization": f"Bearer {ASSEMBLYAI_API_KEY}"}
-        ws = await websockets.connect(VA_URL, additional_headers=headers)
-        bridge = cls(
-            ws=ws,
-            inbound_audio=asyncio.Queue(),
-            outbound_audio=asyncio.Queue(),
-            session_ready=asyncio.Event(),
-            stop=asyncio.Event(),
-        )
-        await ws.send(json.dumps({
-            "type": "session.update",
-            "session": {
-                "system_prompt": SYSTEM_PROMPT,
-                "greeting": GREETING,
-                "input": {"format": {"encoding": "audio/pcm"}},
-                "output": {
-                    "voice": VOICE,
-                    "format": {"encoding": "audio/pcm"},
-                },
-            },
-        }))
-        return bridge
-
-    async def run(self) -> None:
-        await asyncio.gather(self._send_audio(), self._handle_events())
-
-    async def _send_audio(self) -> None:
-        await self.session_ready.wait()
-        while not self.stop.is_set():
-            chunk = await self.inbound_audio.get()
-            if chunk is None:
-                break
-            await self.ws.send(json.dumps({
-                "type": "input.audio",
-                "audio": base64.b64encode(chunk).decode(),
-            }))
-
-    async def _handle_events(self) -> None:
-        async for raw in self.ws:
-            event = json.loads(raw)
-            t = event.get("type")
-
-            if t == "session.ready":
-                LOG.info("AssemblyAI session ready: %s", event.get("session_id"))
-                self.session_ready.set()
-
-            elif t == "transcript.user":
-                LOG.info("User: %s", event.get("text", ""))
-
-            elif t == "transcript.agent":
-                tag = " (interrupted)" if event.get("interrupted") else ""
-                LOG.info("Agent%s: %s", tag, event.get("text", ""))
-
-            elif t == "reply.audio":
-                pcm = base64.b64decode(event["data"])
-                await self.outbound_audio.put(pcm)
-
-            elif t == "reply.done":
-                if event.get("status") == "interrupted":
-                    # Drop any queued reply audio so we don't keep speaking
-                    # over the user.
-                    while not self.outbound_audio.empty():
-                        try:
-                            self.outbound_audio.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
-                    LOG.info("Reply interrupted — flushed playback queue")
-
-            elif t == "session.error":
-                LOG.error("Voice Agent error %s: %s",
-                          event.get("code"), event.get("message"))
-
-    async def close(self) -> None:
-        self.stop.set()
-        try:
-            await self.ws.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Agora side of the bridge
-# ---------------------------------------------------------------------------
-class AgoraBridge:
-    """Wraps the Agora RTC connection, the inbound audio observer, and the
-    outbound PCM data sender. Exposes start() / push_outbound() / close().
-    """
-
-    def __init__(self, channel: str, uid: int, agent: AgentBridge,
-                 loop: asyncio.AbstractEventLoop) -> None:
-        if not AGORA_AVAILABLE:
-            raise RuntimeError(
-                "agora-python-server-sdk is not installed. "
-                "pip install -r requirements.txt"
-            )
-        if not AGORA_APP_ID:
-            raise RuntimeError("AGORA_APP_ID missing — set it in .env")
-
-        self.channel = channel
-        self.uid = uid
-        self.agent = agent
-        self.loop = loop
-
-        # ----- AGORA_BRIDGE_TODO (init): if your SDK version names these
-        # differently, this is the surface area you need to re-bind.
-        cfg = AgoraServiceConfig()
-        cfg.appid = AGORA_APP_ID
-        self.service = AgoraService()
-        self.service.initialize(cfg)
-
-        self.connection = self.service.create_rtc_connection(RTCConnConfig(
+    connection = service.create_rtc_connection(
+        RTCConnConfig(
+            client_role_type=ClientRoleType.CLIENT_ROLE_BROADCASTER,
+            channel_profile=ChannelProfileType.CHANNEL_PROFILE_LIVE_BROADCASTING,
             auto_subscribe_audio=1,
-            auto_subscribe_video=0,
-            client_role_type=1,            # 1 = BROADCASTER (can publish)
-            channel_profile=1,             # 1 = LIVE_BROADCASTING
-        ))
+            audio_subs_options=AudioSubscriptionOptions(
+                pcm_data_only=1,
+                bytes_per_sample=2,
+                number_of_channels=1,
+                sample_rate_hz=SAMPLE_RATE,
+            ),
+        ),
+        RtcConnectionPublishConfig(
+            audio_scenario=AudioScenarioType.AUDIO_SCENARIO_AI_SERVER,
+            is_publish_audio=True,
+            audio_publish_type=AudioPublishType.AUDIO_PUBLISH_TYPE_PCM,
+        ),
+    )
+    ret = connection.connect(AGORA_TOKEN, AGORA_CHANNEL, AGORA_BOT_UID)
+    if ret < 0:
+        raise RuntimeError(f"Agora connect failed: {ret}")
 
-        self.media_factory: MediaNodeFactory = self.service.create_media_node_factory()
-        self.pcm_sender: AudioPcmDataSender = self.media_factory.create_audio_pcm_data_sender()
-        self.audio_track = self.service.create_custom_audio_track_pcm(self.pcm_sender)
+    connection.get_local_user().set_playback_audio_frame_before_mixing_parameters(1, SAMPLE_RATE)
+    connection.register_audio_frame_observer(caller, 0, None)  # 0: Agora's own VAD off
+    connection.publish_audio()
+    print(f"Joined Agora channel '{AGORA_CHANNEL}' as uid {AGORA_BOT_UID}")
+    return service, connection
 
-        self.local_user = self.connection.get_local_user()
-        self.local_user.set_playback_audio_frame_before_mixing_parameters(
-            channels=1, sample_rate_hz=AGORA_RATE,
-        )
-        self.local_user.register_audio_frame_observer(self._make_observer())
+# bot.py (continued): publishing the bot's voice
+class BotVoice:
+    """Pushes reply audio into the channel as the bot's audio track."""
 
-    # -- inbound: caller -> AssemblyAI ---------------------------------------
-    def _make_observer(self) -> "IAudioFrameObserver":
-        agent = self.agent
-        loop = self.loop
+    def __init__(self, connection):
+        self.connection = connection
+        self.pending = bytearray()
 
-        class Observer(IAudioFrameObserver):  # type: ignore[misc]
-            def on_playback_audio_frame_before_mixing(
-                self, channel_id, uid, frame: "AudioFrame",
-            ) -> int:
-                # frame.buffer is 16-bit signed LE PCM at AGORA_RATE, mono.
-                pcm16 = bytes(frame.buffer)
-                pcm24 = resample_pcm16(pcm16, AGORA_RATE, VA_RATE)
-                # Hand off to asyncio thread-safely.
-                loop.call_soon_threadsafe(
-                    agent.inbound_audio.put_nowait, pcm24
-                )
-                return 0
+    def push(self, pcm):
+        # Agora takes PCM in whole milliseconds (32 bytes at 16 kHz mono)
+        self.pending += pcm
+        whole = len(self.pending) - len(self.pending) % BYTES_PER_MS
+        if whole:
+            self.connection.push_audio_pcm_data(bytes(self.pending[:whole]), SAMPLE_RATE, 1)
+            del self.pending[:whole]
 
-            # Other observer hooks must exist but we don't use them.
-            def on_record_audio_frame(self, *_a, **_k):  # noqa: D401
-                return 0
+    def finish(self):
+        if self.pending:  # pad the last partial millisecond with silence
+            self.push(bytes(BYTES_PER_MS - len(self.pending)))
 
-            def on_mixed_audio_frame(self, *_a, **_k):
-                return 0
+    def playing(self):
+        return not self.connection.is_push_to_rtc_completed()
 
-            def on_playback_audio_frame(self, *_a, **_k):
-                return 0
+    def stop(self):
+        self.pending.clear()
+        self.connection.interrupt_audio()  # drop audio Agora has buffered
+# bot.py (continued): listening and barge-in
+BACKCHANNELS = frozenset({
+    "mhm", "mm", "mmhm", "uh", "uhhuh", "huh", "um", "umm", "hmm", "hm",
+    "ah", "oh", "yeah", "yep", "yup", "okay", "ok", "right", "alright", "gotcha",
+})
+_PUNCT = str.maketrans("", "", string.punctuation)
 
-            def on_ear_monitoring_audio_frame(self, *_a, **_k):
-                return 0
 
-        return Observer()
+def is_filler(text, min_words):
+    tokens = text.lower().translate(_PUNCT).split()
+    return len(tokens) < min_words or all(t in BACKCHANNELS for t in tokens)
 
-    # -- outbound: AssemblyAI -> caller --------------------------------------
-    async def pump_outbound(self) -> None:
-        """Pull reply.audio from the agent queue and push it into the
-        Agora channel as PCM frames at 16 kHz.
-        """
-        while not self.agent.stop.is_set():
-            pcm24 = await self.agent.outbound_audio.get()
-            if pcm24 is None:
+
+def on_begin(client, event: BeginEvent):
+    print(f"Speech-to-text session {event.id}")
+
+
+def on_turn(client, event: TurnEvent):
+    text = event.transcript.strip()
+    if not text:
+        return
+    if speaking.is_set():
+        if is_filler(text, min_words=2):
+            return             # "mhm", "yeah": let the bot keep talking
+        interrupted.set()      # a real interruption: stop the reply
+    elif time.monotonic() - last_spoke_at < 1.0 and is_filler(text, min_words=1):
+        return                 # a trailing "mhm" right after the bot finished
+    if event.end_of_turn:
+        print(f"Caller: {text}")
+        turns.put(text)
+
+
+def on_error(client, error: RealTimeError):
+    print(f"Speech-to-text error: {error}")
+# bot.py (continued): thinking and speaking
+def think(user_text):
+    messages.append({"role": "user", "content": user_text})
+    completion = llm.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        max_tokens=200,
+    )
+    reply = " ".join(c.message.content for c in completion.choices if c.message.content).strip()
+    messages.append({"role": "assistant", "content": reply})
+    return reply
+
+
+def speak(text, voice):
+    global last_spoke_at
+    if not text:
+        return
+    print(f"Bot:    {text}")
+    interrupted.clear()
+    speaking.set()
+    try:
+        for chunk in tts.speak(text):
+            if interrupted.is_set():
+                tts.cancel()  # barge-in: the server drops the rest of this reply
                 break
-            pcm16 = resample_pcm16(pcm24, VA_RATE, AGORA_RATE)
-            # AGORA_BRIDGE_TODO (push): the exact signature varies by SDK
-            # version. 2.2.x exposes send_audio_pcm_data(buffer, ts, samples,
-            # bytes_per_sample, channels, sample_rate). If yours differs,
-            # adjust here.
-            samples_per_channel = len(pcm16) // 2  # 16-bit mono
-            self.pcm_sender.send_audio_pcm_data(
-                pcm16, 0, samples_per_channel, 2, 1, AGORA_RATE,
-            )
-            # Pace the writes to roughly real-time (10 ms blocks) so we
-            # don't blast a whole reply into the buffer at once.
-            await asyncio.sleep(samples_per_channel / AGORA_RATE)
-
-    # -- lifecycle -----------------------------------------------------------
-    def start(self) -> None:
-        token = self._build_token()
-        # AGORA_BRIDGE_TODO (connect): some SDK builds use connect(token, channel,
-        # uid) while others use a config object; check your version.
-        self.connection.connect(token, self.channel, str(self.uid))
-        self.local_user.publish_audio(self.audio_track)
-        LOG.info("Joined Agora channel '%s' as uid=%d", self.channel, self.uid)
-
-    def _build_token(self) -> str:
-        if not AGORA_APP_CERTIFICATE:
-            # App Certificate disabled — Agora accepts an empty token.
-            return ""
-        import time
-        expire_ts = int(time.time()) + 3600
-        return RtcTokenBuilder.buildTokenWithUid(
-            AGORA_APP_ID,
-            AGORA_APP_CERTIFICATE,
-            self.channel,
-            self.uid,
-            1,            # Role_Publisher
-            expire_ts,
-        )
-
-    def close(self) -> None:
-        try:
-            self.local_user.unpublish_audio(self.audio_track)
-            self.connection.disconnect()
-            self.service.release()
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("Agora teardown error: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-async def main(channel: str, uid: int) -> None:
-    loop = asyncio.get_running_loop()
-    agent = await AgentBridge.connect()
-    agora: Optional[AgoraBridge] = None
-
-    try:
-        agora = AgoraBridge(channel=channel, uid=uid, agent=agent, loop=loop)
-        agora.start()
-
-        stop_signal = asyncio.Event()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, stop_signal.set)
-            except NotImplementedError:
-                pass  # Windows
-
-        await asyncio.gather(
-            agent.run(),
-            agora.pump_outbound(),
-            stop_signal.wait(),
-        )
+            voice.push(chunk)
+        else:
+            voice.finish()
+        # Synthesis runs faster than real time, so Agora holds a buffer.
+        # Wait for it to play out, or for the caller to cut in.
+        while voice.playing() and not interrupted.is_set():
+            time.sleep(0.05)
+        if interrupted.is_set():
+            voice.stop()
+            print("        (interrupted)")
     finally:
-        await agent.close()
-        if agora is not None:
-            agora.close()
-        LOG.info("Bot stopped.")
+        speaking.clear()
+        last_spoke_at = time.monotonic()
+# bot.py (continued): the main loop
+def main():
+    caller = CallerAudio()
+    service, connection = join_agora(caller)
+    voice = BotVoice(connection)
+    print("Waiting for someone to join and speak...")
+    caller.joined.wait()
+    print(f"Caller uid {caller.caller_uid} is on the line")
 
-
-def cli() -> None:
-    parser = argparse.ArgumentParser(description="Agora <-> Voice Agent API bot")
-    parser.add_argument("--channel", default=DEFAULT_CHANNEL,
-                        help="Agora channel name to join")
-    parser.add_argument("--uid", type=int, default=DEFAULT_BOT_UID,
-                        help="UID the bot publishes under")
-    args = parser.parse_args()
-
-    if not AGORA_AVAILABLE:
-        print(
-            "agora-python-server-sdk is not installed. Run "
-            "`pip install -r requirements.txt` first.",
-            file=sys.stderr,
+    stt.on(RealTimeEvents.Begin, on_begin)
+    stt.on(RealTimeEvents.Turn, on_turn)
+    stt.on(RealTimeEvents.Error, on_error)
+    stt.connect(
+        RealTimeParameters(
+            speech_model="universal-3-6-pro",
+            sample_rate=SAMPLE_RATE,
         )
-        sys.exit(1)
+    )
+    tts.connect()
+    threading.Thread(target=stt.stream, args=(caller.chunks(),), daemon=True).start()
 
     try:
-        asyncio.run(main(args.channel, args.uid))
+        speak(GREETING, voice)
+        while True:
+            try:
+                user_text = turns.get(timeout=30)
+            except queue.Empty:
+                tts.keep_alive()  # the TTS session closes after 2 idle minutes
+                continue
+            speak(think(user_text), voice)
     except KeyboardInterrupt:
-        print("\nDisconnected.")
+        print("\nLeaving the channel...")
+    finally:
+        caller.frames.put(None)
+        stt.disconnect(terminate=True)
+        tts.terminate()
+        connection.disconnect()
+        connection.release()
+        service.release()
 
 
 if __name__ == "__main__":
-    cli()
+    main()
